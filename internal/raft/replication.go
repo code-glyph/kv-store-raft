@@ -20,6 +20,10 @@ func (n *Node) Submit(ctx context.Context, command []byte) (uint64, error) {
 		Term:    n.currentTerm,
 		Command: command,
 	}
+	if err := n.persistEntriesLocked([]LogEntry{entry}); err != nil {
+		n.mu.Unlock()
+		return 0, err
+	}
 	n.logEntries = append(n.logEntries, entry)
 	n.matchIndex[n.nodeID] = newIndex
 	for peerID := range n.peers {

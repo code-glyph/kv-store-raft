@@ -17,14 +17,17 @@ type NodeConfig struct {
 	HeartbeatTimeout time.Duration
 	Transport        Transport
 	StateMachine     StateMachine
+	MetaStore        MetaStore
+	LogStore         LogStore
 	Logger           *log.Logger
 }
 
 type Node struct {
 	mu sync.Mutex
 
-	nodeID string
-	peers  map[string]string
+	nodeID   string
+	peers    map[string]string
+	allPeers map[string]string
 
 	transport Transport
 	logger    *log.Logger
@@ -46,6 +49,8 @@ type Node struct {
 	matchIndex map[string]uint64
 
 	stateMachine StateMachine
+	metaStore    MetaStore
+	logStore     LogStore
 
 	electionResetCh chan struct{}
 }
@@ -77,9 +82,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		peers[id] = addr
 	}
 
-	return &Node{
+	n := &Node{
 		nodeID:           cfg.NodeID,
 		peers:            peers,
+		allPeers:         cfg.Peers,
 		transport:        cfg.Transport,
 		logger:           logger,
 		rnd:              rand.New(rand.NewSource(time.Now().UnixNano() + nodeIDSeed(cfg.NodeID))),
@@ -90,8 +96,50 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		nextIndex:        make(map[string]uint64),
 		matchIndex:       make(map[string]uint64),
 		stateMachine:     cfg.StateMachine,
+		metaStore:        cfg.MetaStore,
+		logStore:         cfg.LogStore,
 		electionResetCh:  make(chan struct{}, 1),
-	}, nil
+	}
+	if err := n.restoreFromStorage(); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+func (n *Node) NodeID() string {
+	return n.nodeID
+}
+
+func (n *Node) CurrentRole() Role {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.state
+}
+
+func (n *Node) LeaderID() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.leaderID
+}
+
+func (n *Node) IsLeader() bool {
+	return n.CurrentRole() == RoleLeader
+}
+
+func (n *Node) LeaderAddress() (string, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.leaderID == "" {
+		return "", false
+	}
+	addr, ok := n.allPeers[n.leaderID]
+	return addr, ok
+}
+
+func (n *Node) LogLength() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.logEntries)
 }
 
 func nodeIDSeed(nodeID string) int64 {
@@ -141,6 +189,7 @@ func (n *Node) HandleRequestVote(req RequestVoteRequest) RequestVoteResponse {
 
 	if n.votedFor == "" || n.votedFor == req.CandidateID {
 		n.votedFor = req.CandidateID
+		n.persistMetaLocked()
 		resp.VoteGranted = true
 		resp.Term = n.currentTerm
 		n.resetElectionTimer()
@@ -178,6 +227,7 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 	}
 
 	// Merge entries with conflict truncation.
+	appended := make([]LogEntry, 0, len(req.Entries))
 	for i, incoming := range req.Entries {
 		localIndex := req.PrevLogIndex + 1 + uint64(i)
 		localTerm, exists := n.termAtLocked(localIndex)
@@ -189,7 +239,14 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 				incoming.Index = localIndex
 			}
 			n.logEntries = append(n.logEntries, incoming)
+			appended = append(appended, incoming)
 		}
+	}
+	if err := n.persistEntriesLocked(appended); err != nil {
+		n.logger.Printf("node=%s log persistence error: %v", n.nodeID, err)
+		resp.Term = n.currentTerm
+		resp.Success = false
+		return resp
 	}
 
 	lastIndex := n.lastLogIndexLocked()
@@ -255,6 +312,7 @@ func (n *Node) startElection(ctx context.Context) {
 	term := n.currentTerm
 	n.votedFor = n.nodeID
 	n.leaderID = ""
+	n.persistMetaLocked()
 	lastLogIndex := n.lastLogIndexLocked()
 	lastLogTerm := n.lastLogTermLocked()
 	n.mu.Unlock()
@@ -338,6 +396,7 @@ func (n *Node) becomeFollowerLocked(term uint64, leaderID string) {
 	n.votedFor = ""
 	n.leaderID = leaderID
 	n.logger.Printf("node=%s role=%s term=%d leader=%s", n.nodeID, RoleFollower.String(), n.currentTerm, leaderID)
+	n.persistMetaLocked()
 	n.resetElectionTimer()
 }
 
@@ -358,3 +417,51 @@ func (n *Node) String() string {
 	return fmt.Sprintf("node=%s state=%s term=%d votedFor=%s leader=%s", n.nodeID, state.String(), term, votedFor, leader)
 }
 
+func (n *Node) persistMetaLocked() {
+	if n.metaStore == nil {
+		return
+	}
+	if err := n.metaStore.SaveMeta(n.currentTerm, n.votedFor); err != nil {
+		n.logger.Printf("node=%s meta persistence error: %v", n.nodeID, err)
+	}
+}
+
+func (n *Node) persistEntriesLocked(entries []LogEntry) error {
+	if n.logStore == nil || len(entries) == 0 {
+		return nil
+	}
+	return n.logStore.AppendEntries(entries)
+}
+
+func (n *Node) restoreFromStorage() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.metaStore != nil {
+		term, vote, err := n.metaStore.LoadMeta()
+		if err != nil {
+			return err
+		}
+		n.currentTerm = term
+		n.votedFor = vote
+	}
+	if n.logStore != nil {
+		entries, err := n.logStore.LoadEntries()
+		if err != nil {
+			return err
+		}
+		n.logEntries = entries
+	}
+	n.commitIndex = 0
+	n.lastApplied = 0
+	return nil
+}
+
+func (n *Node) Close() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.logStore != nil {
+		return n.logStore.Close()
+	}
+	return nil
+}

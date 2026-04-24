@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"kv-store-raft/internal/api"
 	"kv-store-raft/internal/config"
+	"kv-store-raft/internal/kv"
 	"kv-store-raft/internal/raft"
+	"kv-store-raft/internal/storage"
 	"kv-store-raft/internal/transport"
 	"log"
 	"net/http"
@@ -23,6 +26,12 @@ func main() {
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 	logger.Printf("starting raft node id=%s raft_addr=%s peers=%d", configuration.NodeID, configuration.RaftAddr, len(configuration.PeerMap))
 
+	kvStore := kv.NewStore()
+	metaStore := storage.NewMetaStore(configuration.DataDir)
+	logStore, err := storage.NewWAL(configuration.DataDir, 40*time.Millisecond)
+	if err != nil {
+		log.Fatal(err)
+	}
 	transportClient := transport.NewHTTPTransport(configuration.PeerMap)
 	node, err := raft.NewNode(raft.NodeConfig{
 		NodeID:           configuration.NodeID,
@@ -30,22 +39,34 @@ func main() {
 		ElectionTimeout:  time.Duration(configuration.ElectionTimeout) * time.Millisecond,
 		HeartbeatTimeout: time.Duration(configuration.HeartbeatTimeout) * time.Millisecond,
 		Transport:        transportClient,
+		StateMachine:     kvStore,
+		MetaStore:        metaStore,
+		LogStore:         logStore,
 		Logger:           logger,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	mux := http.NewServeMux()
-	transport.RegisterRaftHandlers(mux, node)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	raftMux := http.NewServeMux()
+	transport.RegisterRaftHandlers(raftMux, node)
+	apiHandler := api.NewHandler(node, kvStore, configuration.PeerMap)
+	api.RegisterHandlers(raftMux, apiHandler)
+
+	apiMux := http.NewServeMux()
+	api.RegisterHandlers(apiMux, apiHandler)
+	apiMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	server := &http.Server{
+	raftServer := &http.Server{
 		Addr:    configuration.RaftAddr,
-		Handler: mux,
+		Handler: raftMux,
+	}
+	apiServer := &http.Server{
+		Addr:    configuration.HTTPAddr,
+		Handler: apiMux,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -54,8 +75,15 @@ func main() {
 
 	go func() {
 		logger.Printf("raft rpc server listening on %s", configuration.RaftAddr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := raftServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Printf("raft server error: %v", err)
+			cancel()
+		}
+	}()
+	go func() {
+		logger.Printf("client api server listening on %s", configuration.HTTPAddr)
+		if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Printf("api server error: %v", err)
 			cancel()
 		}
 	}()
@@ -73,7 +101,13 @@ func main() {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Printf("server shutdown error: %v", err)
+	if err := raftServer.Shutdown(shutdownCtx); err != nil {
+		logger.Printf("raft server shutdown error: %v", err)
+	}
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		logger.Printf("api server shutdown error: %v", err)
+	}
+	if err := node.Close(); err != nil {
+		logger.Printf("node close error: %v", err)
 	}
 }
