@@ -41,6 +41,7 @@ func TestReliability_MinorityPartitionCannotCommit(t *testing.T) {
 	}
 
 	assertAtMostOneLeaderPerTerm(t, h, 300*time.Millisecond)
+	h.assertLinearizable(5 * time.Second)
 }
 
 func TestReliability_PartitionHealConvergence(t *testing.T) {
@@ -59,4 +60,5 @@ func TestReliability_PartitionHealConvergence(t *testing.T) {
 		t.Fatalf("write after heal failed: %v", err)
 	}
 	assertAtMostOneLeaderPerTerm(t, h, 400*time.Millisecond)
+	h.assertLinearizable(5 * time.Second)
 }

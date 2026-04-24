@@ -71,6 +71,8 @@ func startCluster(t *testing.T, n int) []*clusterNode {
 			Peers:            peers,
 			ElectionTimeout:  280 * time.Millisecond,
 			HeartbeatTimeout: 80 * time.Millisecond,
+			SubmitTimeout:    2 * time.Second,
+			MaxBatchSize:     64,
 			Transport:        nTransport,
 			StateMachine:     store,
 		})

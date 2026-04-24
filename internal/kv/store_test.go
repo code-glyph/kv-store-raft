@@ -213,3 +213,28 @@ func TestStoreApply_InvalidCommandPayload(t *testing.T) {
 		})
 	}
 }
+
+func TestStoreSnapshotRoundTrip(t *testing.T) {
+	store := NewStore()
+	_, _ = store.Apply(mustEntry(t, 1, 1, Command{Op: OpSet, Key: "a", Value: "1"}))
+	_, _ = store.Apply(mustEntry(t, 2, 1, Command{Op: OpSet, Key: "b", Value: "2"}))
+
+	raw := store.Snapshot()
+	if len(raw) == 0 {
+		t.Fatalf("expected non-empty snapshot payload")
+	}
+
+	restored := NewStore()
+	if err := restored.ApplySnapshot(raw); err != nil {
+		t.Fatalf("apply snapshot: %v", err)
+	}
+
+	va, err := restored.Get("a")
+	if err != nil || va != "1" {
+		t.Fatalf("expected a=1 after restore, got value=%q err=%v", va, err)
+	}
+	vb, err := restored.Get("b")
+	if err != nil || vb != "2" {
+		t.Fatalf("expected b=2 after restore, got value=%q err=%v", vb, err)
+	}
+}

@@ -51,3 +51,33 @@ func TestWAL_MalformedJSONLine(t *testing.T) {
 		t.Fatalf("expected load error for malformed jsonl")
 	}
 }
+
+func TestWAL_RewriteEntries(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := NewWAL(dir, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("new wal: %v", err)
+	}
+	defer wal.Close()
+
+	if err := wal.AppendEntries([]raft.LogEntry{
+		{Index: 1, Term: 1, Command: []byte("a")},
+		{Index: 2, Term: 1, Command: []byte("b")},
+		{Index: 3, Term: 2, Command: []byte("c")},
+	}); err != nil {
+		t.Fatalf("append entries: %v", err)
+	}
+	if err := wal.RewriteEntries([]raft.LogEntry{
+		{Index: 3, Term: 2, Command: []byte("c")},
+	}); err != nil {
+		t.Fatalf("rewrite entries: %v", err)
+	}
+
+	got, err := wal.LoadEntries()
+	if err != nil {
+		t.Fatalf("load entries: %v", err)
+	}
+	if len(got) != 1 || got[0].Index != 3 {
+		t.Fatalf("unexpected rewritten entries: %+v", got)
+	}
+}

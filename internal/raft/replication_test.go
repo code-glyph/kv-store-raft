@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -18,6 +19,28 @@ func (r *recordingStateMachine) Apply(entry LogEntry) (interface{}, error) {
 	defer r.mu.Unlock()
 	r.applied = append(r.applied, entry)
 	return fmt.Sprintf("applied-%d", entry.Index), nil
+}
+
+func (r *recordingStateMachine) Snapshot() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	raw, _ := json.Marshal(r.applied)
+	return raw
+}
+
+func (r *recordingStateMachine) ApplySnapshot(raw []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(raw) == 0 {
+		r.applied = nil
+		return nil
+	}
+	var entries []LogEntry
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return err
+	}
+	r.applied = entries
+	return nil
 }
 
 func (r *recordingStateMachine) entries() []LogEntry {

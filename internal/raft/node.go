@@ -15,10 +15,15 @@ type NodeConfig struct {
 	Peers            map[string]string
 	ElectionTimeout  time.Duration
 	HeartbeatTimeout time.Duration
+	SubmitTimeout    time.Duration
+	MaxBatchSize     int
+	SnapshotInterval uint64
+	LeaseReads       bool
 	Transport        Transport
 	StateMachine     StateMachine
 	MetaStore        MetaStore
 	LogStore         LogStore
+	SnapshotStore    SnapshotStore
 	Logger           *log.Logger
 }
 
@@ -35,6 +40,11 @@ type Node struct {
 
 	electionTimeout  time.Duration
 	heartbeatTimeout time.Duration
+	submitTimeout    time.Duration
+	maxBatchSize     int
+	snapshotInterval uint64
+	leaseReads       bool
+	leaseRenewedAt   time.Time
 
 	state       Role
 	currentTerm uint64
@@ -42,6 +52,8 @@ type Node struct {
 	leaderID    string
 
 	logEntries  []LogEntry
+	snapshotIndex uint64
+	snapshotTerm  uint64
 	commitIndex uint64
 	lastApplied uint64
 
@@ -51,6 +63,7 @@ type Node struct {
 	stateMachine StateMachine
 	metaStore    MetaStore
 	logStore     LogStore
+	snapshotStore SnapshotStore
 
 	electionResetCh chan struct{}
 }
@@ -67,6 +80,21 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 	if cfg.HeartbeatTimeout <= 0 {
 		return nil, errors.New("heartbeat timeout must be > 0")
+	}
+	if cfg.SubmitTimeout < 0 {
+		return nil, errors.New("submit timeout must be >= 0")
+	}
+	if cfg.SubmitTimeout == 0 {
+		cfg.SubmitTimeout = 2 * time.Second
+	}
+	if cfg.MaxBatchSize < 0 {
+		return nil, errors.New("max batch size must be >= 0")
+	}
+	if cfg.MaxBatchSize == 0 {
+		cfg.MaxBatchSize = 64
+	}
+	if cfg.SnapshotInterval == 0 {
+		cfg.SnapshotInterval = 1000
 	}
 
 	logger := cfg.Logger
@@ -91,6 +119,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		rnd:              rand.New(rand.NewSource(time.Now().UnixNano() + nodeIDSeed(cfg.NodeID))),
 		electionTimeout:  cfg.ElectionTimeout,
 		heartbeatTimeout: cfg.HeartbeatTimeout,
+		submitTimeout:    cfg.SubmitTimeout,
+		maxBatchSize:     cfg.MaxBatchSize,
+		snapshotInterval: cfg.SnapshotInterval,
+		leaseReads:       cfg.LeaseReads,
 		state:            RoleFollower,
 		logEntries:       make([]LogEntry, 0),
 		nextIndex:        make(map[string]uint64),
@@ -98,6 +130,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		stateMachine:     cfg.StateMachine,
 		metaStore:        cfg.MetaStore,
 		logStore:         cfg.LogStore,
+		snapshotStore:    cfg.SnapshotStore,
 		electionResetCh:  make(chan struct{}, 1),
 	}
 	if err := n.restoreFromStorage(); err != nil {
@@ -232,7 +265,18 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 		localIndex := req.PrevLogIndex + 1 + uint64(i)
 		localTerm, exists := n.termAtLocked(localIndex)
 		if exists && localTerm != incoming.Term {
-			n.logEntries = n.logEntries[:localIndex-1]
+			if localIndex <= n.snapshotIndex+1 {
+				n.logEntries = n.logEntries[:0]
+			} else {
+				cut := int(localIndex - (n.snapshotIndex + 1))
+				if cut < 0 {
+					cut = 0
+				}
+				if cut > len(n.logEntries) {
+					cut = len(n.logEntries)
+				}
+				n.logEntries = n.logEntries[:cut]
+			}
 		}
 		if !exists || localTerm != incoming.Term {
 			if incoming.Index == 0 {
@@ -412,6 +456,35 @@ func (n *Node) resetElectionTimer() {
 	}
 }
 
+func (n *Node) renewLeaseLocked(now time.Time) {
+	if !n.leaseReads {
+		return
+	}
+	n.leaseRenewedAt = now
+}
+
+func (n *Node) leaderLeaseValidLocked(now time.Time) bool {
+	if !n.leaseReads {
+		return true
+	}
+	if n.state != RoleLeader {
+		return false
+	}
+	if n.leaseRenewedAt.IsZero() {
+		return false
+	}
+	return now.Sub(n.leaseRenewedAt) < n.heartbeatTimeout
+}
+
+func (n *Node) CanServeReadLocally() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state != RoleLeader {
+		return false
+	}
+	return n.leaderLeaseValidLocked(time.Now())
+}
+
 func (n *Node) String() string {
 	state, term, votedFor, leader := n.State()
 	return fmt.Sprintf("node=%s state=%s term=%d votedFor=%s leader=%s", n.nodeID, state.String(), term, votedFor, leader)
@@ -452,8 +525,30 @@ func (n *Node) restoreFromStorage() error {
 		}
 		n.logEntries = entries
 	}
-	n.commitIndex = 0
-	n.lastApplied = 0
+	if n.snapshotStore != nil {
+		index, term, data, err := n.snapshotStore.LoadSnapshot()
+		if err != nil {
+			return err
+		}
+		n.snapshotIndex = index
+		n.snapshotTerm = term
+		if len(data) > 0 && n.stateMachine != nil {
+			if err := n.stateMachine.ApplySnapshot(data); err != nil {
+				return err
+			}
+		}
+		if len(n.logEntries) > 0 {
+			filtered := make([]LogEntry, 0, len(n.logEntries))
+			for _, entry := range n.logEntries {
+				if entry.Index > n.snapshotIndex {
+					filtered = append(filtered, entry)
+				}
+			}
+			n.logEntries = filtered
+		}
+	}
+	n.commitIndex = n.snapshotIndex
+	n.lastApplied = n.snapshotIndex
 	return nil
 }
 

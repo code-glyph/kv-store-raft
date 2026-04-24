@@ -17,6 +17,8 @@ type raftNode interface {
 	NodeID() string
 	CurrentRole() raft.Role
 	LeaderID() string
+	CanServeReadLocally() bool
+	ConfirmReadQuorum(ctx context.Context) error
 }
 
 type storeReader interface {
@@ -154,6 +156,12 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request, key string) 
 	if h.node.CurrentRole() != raft.RoleLeader {
 		_ = h.proxyToLeader(w, r)
 		return
+	}
+	if !h.node.CanServeReadLocally() {
+		if err := h.node.ConfirmReadQuorum(r.Context()); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error(), h.node.LeaderID())
+			return
+		}
 	}
 	value, err := h.store.Get(key)
 	if err != nil {

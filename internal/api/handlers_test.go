@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,10 +14,13 @@ import (
 )
 
 type fakeNode struct {
-	nodeID   string
-	role     raft.Role
-	leaderID string
-	submits  [][]byte
+	nodeID              string
+	role                raft.Role
+	leaderID            string
+	submits             [][]byte
+	canServeReadLocally bool
+	confirmReadErr      error
+	confirmReadCalls    int
 }
 
 func (f *fakeNode) Submit(_ context.Context, command []byte) (uint64, error) {
@@ -27,6 +31,13 @@ func (f *fakeNode) Submit(_ context.Context, command []byte) (uint64, error) {
 func (f *fakeNode) NodeID() string         { return f.nodeID }
 func (f *fakeNode) CurrentRole() raft.Role { return f.role }
 func (f *fakeNode) LeaderID() string       { return f.leaderID }
+func (f *fakeNode) CanServeReadLocally() bool {
+	return f.canServeReadLocally
+}
+func (f *fakeNode) ConfirmReadQuorum(_ context.Context) error {
+	f.confirmReadCalls++
+	return f.confirmReadErr
+}
 
 type fakeStore struct {
 	values map[string]string
@@ -41,7 +52,7 @@ func (s *fakeStore) Get(key string) (string, error) {
 }
 
 func TestHandleKV_LeaderWrite(t *testing.T) {
-	node := &fakeNode{nodeID: "n1", role: raft.RoleLeader, leaderID: "n1"}
+	node := &fakeNode{nodeID: "n1", role: raft.RoleLeader, leaderID: "n1", canServeReadLocally: true}
 	store := &fakeStore{values: map[string]string{}}
 	h := NewHandler(node, store, map[string]string{"n1": "localhost:9000"})
 
@@ -70,7 +81,7 @@ func TestHandleKV_FollowerWriteProxy(t *testing.T) {
 	defer leaderSrv.Close()
 
 	addr := strings.TrimPrefix(leaderSrv.URL, "http://")
-	node := &fakeNode{nodeID: "n2", role: raft.RoleFollower, leaderID: "n1"}
+	node := &fakeNode{nodeID: "n2", role: raft.RoleFollower, leaderID: "n1", canServeReadLocally: false}
 	store := &fakeStore{values: map[string]string{}}
 	h := NewHandler(node, store, map[string]string{"n1": addr})
 
@@ -93,7 +104,7 @@ func TestHandleKV_LeaderDefaultReadWithFollowerProxy(t *testing.T) {
 	defer leaderSrv.Close()
 
 	addr := strings.TrimPrefix(leaderSrv.URL, "http://")
-	node := &fakeNode{nodeID: "n2", role: raft.RoleFollower, leaderID: "n1"}
+	node := &fakeNode{nodeID: "n2", role: raft.RoleFollower, leaderID: "n1", canServeReadLocally: false}
 	store := &fakeStore{values: map[string]string{"a": "local"}}
 	h := NewHandler(node, store, map[string]string{"n1": addr})
 
@@ -114,7 +125,7 @@ func TestHandleKV_LeaderDefaultReadWithFollowerProxy(t *testing.T) {
 }
 
 func TestHandleKV_MissingKey(t *testing.T) {
-	node := &fakeNode{nodeID: "n1", role: raft.RoleLeader, leaderID: "n1"}
+	node := &fakeNode{nodeID: "n1", role: raft.RoleLeader, leaderID: "n1", canServeReadLocally: true}
 	store := &fakeStore{values: map[string]string{}}
 	h := NewHandler(node, store, map[string]string{"n1": "localhost:9000"})
 	mux := http.NewServeMux()
@@ -125,5 +136,51 @@ func TestHandleKV_MissingKey(t *testing.T) {
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleKV_LeaderReadLeaseFallbackSuccess(t *testing.T) {
+	node := &fakeNode{
+		nodeID:              "n1",
+		role:                raft.RoleLeader,
+		leaderID:            "n1",
+		canServeReadLocally: false,
+	}
+	store := &fakeStore{values: map[string]string{"a": "v"}}
+	h := NewHandler(node, store, map[string]string{"n1": "localhost:9000"})
+
+	mux := http.NewServeMux()
+	RegisterHandlers(mux, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/kv/a", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if node.confirmReadCalls != 1 {
+		t.Fatalf("expected confirm read quorum to be called once, got %d", node.confirmReadCalls)
+	}
+}
+
+func TestHandleKV_LeaderReadLeaseFallbackFailure(t *testing.T) {
+	node := &fakeNode{
+		nodeID:              "n1",
+		role:                raft.RoleLeader,
+		leaderID:            "n1",
+		canServeReadLocally: false,
+		confirmReadErr:      errors.New("quorum failed"),
+	}
+	store := &fakeStore{values: map[string]string{"a": "v"}}
+	h := NewHandler(node, store, map[string]string{"n1": "localhost:9000"})
+
+	mux := http.NewServeMux()
+	RegisterHandlers(mux, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/kv/a", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d body=%s", rr.Code, rr.Body.String())
 	}
 }

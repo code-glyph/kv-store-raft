@@ -89,6 +89,47 @@ func (w *WAL) LoadEntries() ([]raft.LogEntry, error) {
 	return out, nil
 }
 
+func (w *WAL) RewriteEntries(entries []raft.LogEntry) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if err := w.syncLocked(); err != nil {
+		return err
+	}
+	if err := w.file.Close(); err != nil {
+		return err
+	}
+
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		b, err := json.Marshal(entry)
+		if err != nil {
+			_ = f.Close()
+			return err
+		}
+		if _, err := f.Write(append(b, '\n')); err != nil {
+			_ = f.Close()
+			return err
+		}
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	appendFile, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
+	_ = f.Close()
+	w.file = appendFile
+	w.pending = false
+	return nil
+}
+
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

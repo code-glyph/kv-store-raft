@@ -59,6 +59,8 @@ func newTestNode(t *testing.T, id string, peers map[string]string, mt *mockTrans
 		Peers:            peers,
 		ElectionTimeout:  80 * time.Millisecond,
 		HeartbeatTimeout: 25 * time.Millisecond,
+		SubmitTimeout:    2 * time.Second,
+		MaxBatchSize:     64,
 		Transport:        mt,
 		Logger:           log.New(io.Discard, "", 0),
 	})
@@ -189,6 +191,155 @@ func TestRandomizedElectionTimeout_Range(t *testing.T) {
 	}
 }
 
+func TestNewNode_SubmitTimeoutDefaultsToTwoSeconds(t *testing.T) {
+	mt := newMockTransport()
+	node, err := NewNode(NodeConfig{
+		NodeID:           "n1",
+		Peers:            map[string]string{"n1": "inproc-1"},
+		ElectionTimeout:  80 * time.Millisecond,
+		HeartbeatTimeout: 25 * time.Millisecond,
+		MaxBatchSize:     64,
+		Transport:        mt,
+		Logger:           log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+	if node.submitTimeout != 2*time.Second {
+		t.Fatalf("expected default submit timeout %s, got %s", 2*time.Second, node.submitTimeout)
+	}
+}
+
+func TestNewNode_SubmitTimeoutRejectsNegative(t *testing.T) {
+	mt := newMockTransport()
+	_, err := NewNode(NodeConfig{
+		NodeID:           "n1",
+		Peers:            map[string]string{"n1": "inproc-1"},
+		ElectionTimeout:  80 * time.Millisecond,
+		HeartbeatTimeout: 25 * time.Millisecond,
+		SubmitTimeout:    -1 * time.Millisecond,
+		MaxBatchSize:     64,
+		Transport:        mt,
+		Logger:           log.New(io.Discard, "", 0),
+	})
+	if err == nil {
+		t.Fatalf("expected error for negative submit timeout")
+	}
+}
+
+func TestNewNode_MaxBatchSizeDefaultsToSixtyFour(t *testing.T) {
+	mt := newMockTransport()
+	node, err := NewNode(NodeConfig{
+		NodeID:           "n1",
+		Peers:            map[string]string{"n1": "inproc-1"},
+		ElectionTimeout:  80 * time.Millisecond,
+		HeartbeatTimeout: 25 * time.Millisecond,
+		SubmitTimeout:    2 * time.Second,
+		Transport:        mt,
+		Logger:           log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+	if node.maxBatchSize != 64 {
+		t.Fatalf("expected default max batch size 64, got %d", node.maxBatchSize)
+	}
+}
+
+func TestNewNode_MaxBatchSizeRejectsNegative(t *testing.T) {
+	mt := newMockTransport()
+	_, err := NewNode(NodeConfig{
+		NodeID:           "n1",
+		Peers:            map[string]string{"n1": "inproc-1"},
+		ElectionTimeout:  80 * time.Millisecond,
+		HeartbeatTimeout: 25 * time.Millisecond,
+		SubmitTimeout:    2 * time.Second,
+		MaxBatchSize:     -1,
+		Transport:        mt,
+		Logger:           log.New(io.Discard, "", 0),
+	})
+	if err == nil {
+		t.Fatalf("expected error for negative max batch size")
+	}
+}
+
+func TestLeaderLeaseValidityWindow(t *testing.T) {
+	mt := newMockTransport()
+	node, err := NewNode(NodeConfig{
+		NodeID:           "n1",
+		Peers:            map[string]string{"n1": "inproc-1"},
+		ElectionTimeout:  80 * time.Millisecond,
+		HeartbeatTimeout: 40 * time.Millisecond,
+		SubmitTimeout:    2 * time.Second,
+		MaxBatchSize:     64,
+		LeaseReads:       true,
+		Transport:        mt,
+		Logger:           log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+
+	node.mu.Lock()
+	node.state = RoleLeader
+	node.leaseRenewedAt = time.Now().Add(-20 * time.Millisecond)
+	node.mu.Unlock()
+	if !node.CanServeReadLocally() {
+		t.Fatalf("expected fresh lease to allow local read")
+	}
+
+	node.mu.Lock()
+	node.leaseRenewedAt = time.Now().Add(-100 * time.Millisecond)
+	node.mu.Unlock()
+	if node.CanServeReadLocally() {
+		t.Fatalf("expected stale lease to disallow local read")
+	}
+}
+
+func TestConfirmReadQuorumRenewsLease(t *testing.T) {
+	mt := newMockTransport()
+	peers := map[string]string{
+		"n1": "inproc-1",
+		"n2": "inproc-2",
+		"n3": "inproc-3",
+	}
+	newNode := func(id string) *Node {
+		n, err := NewNode(NodeConfig{
+			NodeID:           id,
+			Peers:            peers,
+			ElectionTimeout:  80 * time.Millisecond,
+			HeartbeatTimeout: 40 * time.Millisecond,
+			SubmitTimeout:    2 * time.Second,
+			MaxBatchSize:     64,
+			LeaseReads:       id == "n1",
+			Transport:        mt,
+			Logger:           log.New(io.Discard, "", 0),
+		})
+		if err != nil {
+			t.Fatalf("new node %s: %v", id, err)
+		}
+		mt.register(id, n)
+		return n
+	}
+	leader := newNode("n1")
+	_ = newNode("n2")
+	_ = newNode("n3")
+
+	leader.mu.Lock()
+	leader.state = RoleLeader
+	leader.currentTerm = 1
+	leader.leaderID = "n1"
+	leader.leaseRenewedAt = time.Time{}
+	leader.mu.Unlock()
+
+	if err := leader.ConfirmReadQuorum(context.Background()); err != nil {
+		t.Fatalf("confirm read quorum failed: %v", err)
+	}
+	if !leader.CanServeReadLocally() {
+		t.Fatalf("expected lease renewal after quorum confirmation")
+	}
+}
+
 func buildCluster(t *testing.T, n int, electionTimeout time.Duration, heartbeatTimeout time.Duration) []*Node {
 	cluster := buildClusterWithControl(t, n, electionTimeout, heartbeatTimeout)
 	return cluster.nodes
@@ -224,6 +375,8 @@ func buildClusterWithControl(t *testing.T, n int, electionTimeout time.Duration,
 			Peers:            peers,
 			ElectionTimeout:  electionTimeout,
 			HeartbeatTimeout: heartbeatTimeout,
+			SubmitTimeout:    2 * time.Second,
+			MaxBatchSize:     64,
 			Transport:        mt,
 			Logger:           log.New(io.Discard, "", 0),
 		})

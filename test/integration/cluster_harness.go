@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anishathalye/porcupine"
+
 	"kv-store-raft/internal/kv"
 	"kv-store-raft/internal/raft"
 	"kv-store-raft/internal/storage"
@@ -29,6 +31,9 @@ type reliabilityHarness struct {
 	peers    map[string]string
 	nodes    map[string]*reliabilityNode
 	dataDirs map[string]string
+	opsMu    sync.Mutex
+	ops      []porcupine.Operation
+	clientID map[string]int
 }
 
 func newReliabilityHarness(t *testing.T, n int) *reliabilityHarness {
@@ -39,10 +44,12 @@ func newReliabilityHarness(t *testing.T, n int) *reliabilityHarness {
 		peers:    make(map[string]string, n),
 		nodes:    make(map[string]*reliabilityNode, n),
 		dataDirs: make(map[string]string, n),
+		clientID: make(map[string]int, n),
 	}
 	for i := 1; i <= n; i++ {
 		id := fmt.Sprintf("n%d", i)
 		h.peers[id] = id
+		h.clientID[id] = i - 1
 	}
 	for i := 1; i <= n; i++ {
 		id := fmt.Sprintf("n%d", i)
@@ -73,6 +80,8 @@ func (h *reliabilityHarness) startNode(id string) {
 		Peers:            h.peers,
 		ElectionTimeout:  250 * time.Millisecond,
 		HeartbeatTimeout: 70 * time.Millisecond,
+		SubmitTimeout:    2 * time.Second,
+		MaxBatchSize:     64,
 		Transport:        transport,
 		StateMachine:     store,
 		MetaStore:        meta,
@@ -104,7 +113,19 @@ func (h *reliabilityHarness) stopAll() {
 
 func (h *reliabilityHarness) waitForSingleLeader(timeout time.Duration) string {
 	h.t.Helper()
+	// After partitions / elections, it is common to briefly observe exactly one
+	// node still reporting RoleLeader while leadership is actually in flux.
+	// Require a short stable window so callers (e.g. immediate Submit) do not
+	// race a stale leader that is about to step down.
+	const stability = 150 * time.Millisecond
+	return h.waitForStableSingleLeader(timeout, stability)
+}
+
+func (h *reliabilityHarness) waitForStableSingleLeader(timeout, stability time.Duration) string {
+	h.t.Helper()
 	deadline := time.Now().Add(timeout)
+	var stableID string
+	var stableSince time.Time
 	for time.Now().Before(deadline) {
 		leaders := make([]string, 0)
 		for id, n := range h.nodes {
@@ -113,22 +134,35 @@ func (h *reliabilityHarness) waitForSingleLeader(timeout time.Duration) string {
 			}
 		}
 		if len(leaders) == 1 {
-			return leaders[0]
+			id := leaders[0]
+			if id != stableID {
+				stableID = id
+				stableSince = time.Now()
+			}
+			if time.Since(stableSince) >= stability {
+				return id
+			}
+		} else {
+			stableID = ""
+			stableSince = time.Time{}
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	h.dumpState("waitForSingleLeader timeout")
-	h.t.Fatalf("no single leader within %s", timeout)
+	h.dumpState("waitForStableSingleLeader timeout")
+	h.t.Fatalf("no stable single leader within %s (need %s stability)", timeout, stability)
 	return ""
 }
 
 func (h *reliabilityHarness) waitForSingleLeaderInGroup(nodeIDs []string, timeout time.Duration) string {
 	h.t.Helper()
+	const stability = 150 * time.Millisecond
 	set := make(map[string]bool, len(nodeIDs))
 	for _, id := range nodeIDs {
 		set[id] = true
 	}
 	deadline := time.Now().Add(timeout)
+	var stableID string
+	var stableSince time.Time
 	for time.Now().Before(deadline) {
 		leaders := make([]string, 0)
 		for id, n := range h.nodes {
@@ -140,12 +174,22 @@ func (h *reliabilityHarness) waitForSingleLeaderInGroup(nodeIDs []string, timeou
 			}
 		}
 		if len(leaders) == 1 {
-			return leaders[0]
+			id := leaders[0]
+			if id != stableID {
+				stableID = id
+				stableSince = time.Now()
+			}
+			if time.Since(stableSince) >= stability {
+				return id
+			}
+		} else {
+			stableID = ""
+			stableSince = time.Time{}
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
 	h.dumpState("waitForSingleLeaderInGroup timeout")
-	h.t.Fatalf("no single leader in group %v within %s", nodeIDs, timeout)
+	h.t.Fatalf("no stable single leader in group %v within %s (need %s stability)", nodeIDs, timeout, stability)
 	return ""
 }
 
@@ -161,7 +205,7 @@ func (h *reliabilityHarness) firstFollower() string {
 
 func (h *reliabilityHarness) submitOnLeader(command []byte) (uint64, error) {
 	leader := h.waitForSingleLeader(3 * time.Second)
-	return h.nodes[leader].node.Submit(context.Background(), command)
+	return h.submitOnNode(leader, command)
 }
 
 func (h *reliabilityHarness) submitOnNode(id string, command []byte) (uint64, error) {
@@ -169,7 +213,35 @@ func (h *reliabilityHarness) submitOnNode(id string, command []byte) (uint64, er
 	if n == nil {
 		return 0, fmt.Errorf("node not found: %s", id)
 	}
-	return n.node.Submit(context.Background(), command)
+	input := parseLinearizabilityInput(command)
+	call := time.Now().UnixNano()
+	index, err := n.node.Submit(context.Background(), command)
+	ret := time.Now().UnixNano()
+	h.recordOperation(id, call, ret, input, linearizabilityOutput{
+		OK:    err == nil,
+		Value: linearizabilityOutputValue(input, err),
+	})
+	return index, err
+}
+
+func (h *reliabilityHarness) recordOperation(nodeID string, call, ret int64, input linearizabilityInput, output linearizabilityOutput) {
+	h.opsMu.Lock()
+	h.ops = append(h.ops, porcupine.Operation{
+		ClientId: h.clientID[nodeID],
+		Input:    input,
+		Call:     call,
+		Output:   output,
+		Return:   ret,
+	})
+	h.opsMu.Unlock()
+}
+
+func (h *reliabilityHarness) assertLinearizable(timeout time.Duration) {
+	h.t.Helper()
+	h.opsMu.Lock()
+	ops := append([]porcupine.Operation(nil), h.ops...)
+	h.opsMu.Unlock()
+	assertLinearizableOperations(h.t, ops, timeout)
 }
 
 func (h *reliabilityHarness) isolateGroup(group []string) {

@@ -8,6 +8,12 @@ type MetaStore interface {
 type LogStore interface {
 	AppendEntries(entries []LogEntry) error
 	LoadEntries() ([]LogEntry, error)
+	RewriteEntries(entries []LogEntry) error
 	Sync() error
 	Close() error
+}
+
+type SnapshotStore interface {
+	SaveSnapshot(lastIncludedIndex, lastIncludedTerm uint64, data []byte) error
+	LoadSnapshot() (lastIncludedIndex, lastIncludedTerm uint64, data []byte, err error)
 }

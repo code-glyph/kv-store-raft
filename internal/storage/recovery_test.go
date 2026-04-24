@@ -28,7 +28,12 @@ func TestLoadRecoveredState(t *testing.T) {
 		t.Fatalf("sync wal: %v", err)
 	}
 
-	recovered, err := LoadRecoveredState(meta, wal)
+	snapshot := NewSnapshotStore(dir)
+	if err := snapshot.SaveSnapshot(1, 1, []byte("state")); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+
+	recovered, err := LoadRecoveredState(meta, wal, snapshot)
 	if err != nil {
 		t.Fatalf("load recovered state: %v", err)
 	}
@@ -37,5 +42,8 @@ func TestLoadRecoveredState(t *testing.T) {
 	}
 	if len(recovered.LogEntries) != 2 || recovered.LogEntries[1].Term != 2 {
 		t.Fatalf("unexpected recovered entries: %+v", recovered.LogEntries)
+	}
+	if recovered.SnapshotIndex != 1 || recovered.SnapshotTerm != 1 || string(recovered.SnapshotData) != "state" {
+		t.Fatalf("unexpected recovered snapshot: %+v", recovered)
 	}
 }

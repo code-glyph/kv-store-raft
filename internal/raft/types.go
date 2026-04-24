@@ -11,4 +11,6 @@ type LogEntry struct {
 // StateMachine is the consumer of committed log entries.
 type StateMachine interface {
 	Apply(entry LogEntry) (interface{}, error)
+	Snapshot() []byte
+	ApplySnapshot([]byte) error
 }

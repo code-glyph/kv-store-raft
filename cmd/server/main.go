@@ -28,6 +28,7 @@ func main() {
 
 	kvStore := kv.NewStore()
 	metaStore := storage.NewMetaStore(configuration.DataDir)
+	snapshotStore := storage.NewSnapshotStore(configuration.DataDir)
 	logStore, err := storage.NewWAL(configuration.DataDir, 40*time.Millisecond)
 	if err != nil {
 		log.Fatal(err)
@@ -38,10 +39,15 @@ func main() {
 		Peers:            configuration.PeerMap,
 		ElectionTimeout:  time.Duration(configuration.ElectionTimeout) * time.Millisecond,
 		HeartbeatTimeout: time.Duration(configuration.HeartbeatTimeout) * time.Millisecond,
+		SubmitTimeout:    2 * time.Second,
+		MaxBatchSize:     64,
+		SnapshotInterval: 1000,
+		LeaseReads:       false,
 		Transport:        transportClient,
 		StateMachine:     kvStore,
 		MetaStore:        metaStore,
 		LogStore:         logStore,
+		SnapshotStore:    snapshotStore,
 		Logger:           logger,
 	})
 	if err != nil {
@@ -55,10 +61,6 @@ func main() {
 
 	apiMux := http.NewServeMux()
 	api.RegisterHandlers(apiMux, apiHandler)
-	apiMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
 
 	raftServer := &http.Server{
 		Addr:    configuration.RaftAddr,

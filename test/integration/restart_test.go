@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anishathalye/porcupine"
+
 	"kv-store-raft/internal/kv"
 	"kv-store-raft/internal/raft"
 	"kv-store-raft/internal/storage"
@@ -22,6 +24,7 @@ func (noopTransport) AppendEntries(context.Context, string, raft.AppendEntriesRe
 
 func TestRestart_RestoreTermVoteAndLog(t *testing.T) {
 	dir := t.TempDir()
+	ops := make([]porcupine.Operation, 0, 1)
 
 	// First boot: elect leader in single-node cluster and append one entry.
 	store1 := kv.NewStore()
@@ -34,6 +37,8 @@ func TestRestart_RestoreTermVoteAndLog(t *testing.T) {
 		Peers:            map[string]string{"n1": "127.0.0.1:0"},
 		ElectionTimeout:  120 * time.Millisecond,
 		HeartbeatTimeout: 40 * time.Millisecond,
+		SubmitTimeout:    2 * time.Second,
+		MaxBatchSize:     64,
 		Transport:        noopTransport{},
 		StateMachine:     store1,
 		MetaStore:        storage.NewMetaStore(dir),
@@ -45,7 +50,22 @@ func TestRestart_RestoreTermVoteAndLog(t *testing.T) {
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	node1.Run(ctx1)
 	time.Sleep(300 * time.Millisecond)
-	if _, err := node1.Submit(context.Background(), []byte(`{"op":"set","key":"k","value":"v"}`)); err != nil {
+	cmd := []byte(`{"op":"set","key":"k","value":"v"}`)
+	input := parseLinearizabilityInput(cmd)
+	call := time.Now().UnixNano()
+	_, err = node1.Submit(context.Background(), cmd)
+	ret := time.Now().UnixNano()
+	ops = append(ops, porcupine.Operation{
+		ClientId: 0,
+		Input:    input,
+		Call:     call,
+		Output: linearizabilityOutput{
+			OK:    err == nil,
+			Value: linearizabilityOutputValue(input, err),
+		},
+		Return: ret,
+	})
+	if err != nil {
 		t.Fatalf("submit on node1: %v", err)
 	}
 	cancel1()
@@ -64,6 +84,8 @@ func TestRestart_RestoreTermVoteAndLog(t *testing.T) {
 		Peers:            map[string]string{"n1": "127.0.0.1:0"},
 		ElectionTimeout:  120 * time.Millisecond,
 		HeartbeatTimeout: 40 * time.Millisecond,
+		SubmitTimeout:    2 * time.Second,
+		MaxBatchSize:     64,
 		Transport:        noopTransport{},
 		StateMachine:     store2,
 		MetaStore:        storage.NewMetaStore(dir),
@@ -84,4 +106,6 @@ func TestRestart_RestoreTermVoteAndLog(t *testing.T) {
 	if node2.LogLength() == 0 {
 		t.Fatalf("expected restored log entries")
 	}
+
+	assertLinearizableOperations(t, ops, 5*time.Second)
 }

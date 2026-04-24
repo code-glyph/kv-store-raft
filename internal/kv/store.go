@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -75,4 +76,34 @@ func (s *Store) Get(key string) (string, error) {
 		return "", ErrKeyNotFound
 	}
 	return value, nil
+}
+
+func (s *Store) Snapshot() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	raw, err := json.Marshal(s.data)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func (s *Store) ApplySnapshot(raw []byte) error {
+	if len(raw) == 0 {
+		s.mu.Lock()
+		s.data = make(map[string]string)
+		s.mu.Unlock()
+		return nil
+	}
+	var next map[string]string
+	if err := json.Unmarshal(raw, &next); err != nil {
+		return err
+	}
+	if next == nil {
+		next = make(map[string]string)
+	}
+	s.mu.Lock()
+	s.data = next
+	s.mu.Unlock()
+	return nil
 }

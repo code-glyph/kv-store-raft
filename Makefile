@@ -8,7 +8,7 @@ build:
 	go build -o $(BIN_DIR)/$(APP_NAME) cmd/server/main.go
 
 test:
-	go test ./...
+	go test -race ./...
 
 run-node:
 	./$(BIN_DIR)/$(APP_NAME) \

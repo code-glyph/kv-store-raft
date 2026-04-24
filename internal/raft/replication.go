@@ -7,6 +7,7 @@ import (
 )
 
 var ErrNotLeader = errors.New("not leader")
+var ErrReadQuorumUnavailable = errors.New("unable to confirm read quorum")
 
 func (n *Node) Submit(ctx context.Context, command []byte) (uint64, error) {
 	n.mu.Lock()
@@ -33,7 +34,7 @@ func (n *Node) Submit(ctx context.Context, command []byte) (uint64, error) {
 	}
 	n.mu.Unlock()
 
-	deadline := time.NewTimer(2 * time.Second)
+	deadline := time.NewTimer(n.submitTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
@@ -73,22 +74,28 @@ func (n *Node) replicateOnce(ctx context.Context) error {
 	}
 	n.mu.Unlock()
 
+	successes := 1 // leader itself
 	for _, peerID := range peerIDs {
-		n.replicateToPeer(ctx, peerID, term)
+		if n.replicateToPeer(ctx, peerID, term) {
+			successes++
+		}
 	}
 
 	n.mu.Lock()
+	if n.state == RoleLeader && n.currentTerm == term && successes >= n.majority() {
+		n.renewLeaseLocked(time.Now())
+	}
 	err := n.advanceCommitIndexLocked()
 	n.mu.Unlock()
 	return err
 }
 
-func (n *Node) replicateToPeer(ctx context.Context, peerID string, term uint64) {
+func (n *Node) replicateToPeer(ctx context.Context, peerID string, term uint64) bool {
 	for attempt := 0; attempt < 8; attempt++ {
 		n.mu.Lock()
 		if n.state != RoleLeader || n.currentTerm != term {
 			n.mu.Unlock()
-			return
+			return false
 		}
 
 		nextIdx := n.nextIndex[peerID]
@@ -100,8 +107,15 @@ func (n *Node) replicateToPeer(ctx context.Context, peerID string, term uint64) 
 		prevTerm, _ := n.termAtLocked(prevIdx)
 		var entries []LogEntry
 		if nextIdx <= n.lastLogIndexLocked() {
-			start := int(nextIdx - 1)
-			entries = append(entries, n.logEntries[start:]...)
+			start := int(nextIdx - (n.snapshotIndex + 1))
+			if start < 0 {
+				start = 0
+			}
+			end := len(n.logEntries)
+			if n.maxBatchSize > 0 && start+n.maxBatchSize < end {
+				end = start + n.maxBatchSize
+			}
+			entries = append(entries, n.logEntries[start:end]...)
 		}
 		leaderCommit := n.commitIndex
 		n.mu.Unlock()
@@ -116,25 +130,57 @@ func (n *Node) replicateToPeer(ctx context.Context, peerID string, term uint64) 
 		}
 		resp, err := n.transport.AppendEntries(ctx, peerID, req)
 		if err != nil {
-			return
+			return false
 		}
 
 		n.mu.Lock()
 		if resp.Term > n.currentTerm {
 			n.becomeFollowerLocked(resp.Term, "")
 			n.mu.Unlock()
-			return
+			return false
 		}
 		if resp.Success {
 			match := prevIdx + uint64(len(entries))
 			n.matchIndex[peerID] = match
 			n.nextIndex[peerID] = match + 1
 			n.mu.Unlock()
-			return
+			return true
 		}
 		if n.nextIndex[peerID] > 1 {
 			n.nextIndex[peerID]--
 		}
 		n.mu.Unlock()
 	}
+	return false
+}
+
+func (n *Node) ConfirmReadQuorum(ctx context.Context) error {
+	n.mu.Lock()
+	if n.state != RoleLeader {
+		n.mu.Unlock()
+		return ErrNotLeader
+	}
+	if n.leaderLeaseValidLocked(time.Now()) {
+		n.mu.Unlock()
+		return nil
+	}
+	timeout := n.heartbeatTimeout
+	if timeout <= 0 {
+		timeout = 100 * time.Millisecond
+	}
+	n.mu.Unlock()
+
+	confirmCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := n.replicateOnce(confirmCtx); err != nil {
+		return err
+	}
+
+	n.mu.Lock()
+	valid := n.leaderLeaseValidLocked(time.Now())
+	n.mu.Unlock()
+	if !valid {
+		return ErrReadQuorumUnavailable
+	}
+	return nil
 }
